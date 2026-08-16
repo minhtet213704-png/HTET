@@ -5,13 +5,19 @@ import cv2
 import ddddocr
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-ADMIN_ID = os.environ.get("ADMIN_ID", "")
-REPO_OWNER = os.environ.get("REPO_OWNER", "")
-REPO_NAME = os.environ.get("REPO_NAME", "")
+BOT_TOKEN = "8920875247:AAFSTwtpA9Fo_noQERhW6XT6Zg8pjTsr-6o"
+if ":" not in BOT_TOKEN:
+    raise ValueError(
+        "Invalid Telegram bot token. BOT_TOKEN စာကြောင်းမှာ "
+        "BotFather token ထည့်ပါ။"
+    )
+ADMIN_ID = "1901101365"
+LOCAL_DATA_DIR = os.path.abspath(
+    os.environ.get("BOT_DATA_DIR", os.path.dirname(__file__))
+)
+os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+
 SUCCESS_CODE = asyncio.Queue()
 bot = AsyncTeleBot(BOT_TOKEN)
 user_data = {}
@@ -25,16 +31,10 @@ captcha_state = {}
 retry_counts = {}
 session = None
 _connector = None
-CONCURRENCY = 300
+CONCURRENCY = 100
 _voucher_sem = None
 _start_time = time.monotonic()
-LOCAL_DATA_DIR = Path(__file__).resolve().parent
-
-def is_admin(chat_id):
-    return bool(ADMIN_ID) and str(chat_id) == ADMIN_ID
-
-def github_storage_enabled():
-    return bool(GITHUB_TOKEN and REPO_OWNER and REPO_NAME)
+_local_file_lock = asyncio.Lock()
 
 async def handle(request):
     return web.Response(text="Bot is awake and running 24/7!")
@@ -44,52 +44,75 @@ async def web_server():
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get('PORT', 8096))
+    port = int(os.environ.get('PORT', 8099))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"Web server started on port {port}")
 
+
+async def configure_bot_commands():
+    await bot.set_my_commands([
+        telebot.types.BotCommand("/start", "Bot စတင်ရန်"),
+        telebot.types.BotCommand("key", "Key စစ်ဆေးရန်"),
+        telebot.types.BotCommand("input", "Session URL ထည့်ရန်"),
+        telebot.types.BotCommand("scan ", "Scan စတင်ရန်"),
+        telebot.types.
+BotCommand("stop", "stop ရပ်ရန်"),
+    ])
+
+
 async def get_file_content(path):
-    if not github_storage_enabled():
-        file_path = LOCAL_DATA_DIR / path
+    """Read a JSON object from the local bot data directory."""
+    local_path = os.path.join(LOCAL_DATA_DIR, os.path.basename(path))
+
+    async with _local_file_lock:
         try:
-            content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
-            return json.loads(content), None
+            def read_json():
+                with open(local_path, "r", encoding="utf-8") as file:
+                    return json.load(file)
+
+            data = await asyncio.to_thread(read_json)
+            if not isinstance(data, dict):
+                raise ValueError(f"{os.path.basename(path)} must contain a JSON object")
+            return data, None
         except FileNotFoundError:
             return {}, None
-        except (OSError, json.JSONDecodeError) as error:
-            print(f"Local data read error for {path}: {error}")
+        except (json.JSONDecodeError, ValueError) as error:
+            print(f"Local data file error ({os.path.basename(path)}): {error}")
             return {}, None
 
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    async with session.get(url, headers=headers) as response:
-        if response.status == 200:
-            data = await response.json()
-            content = base64.b64decode(data['content']).decode('utf-8')
-            return json.loads(content), data['sha']
-    return {}, None
-
 async def update_file_content(path, content, sha, message):
-    if not github_storage_enabled():
-        file_path = LOCAL_DATA_DIR / path
-        serialized = json.dumps(content, ensure_ascii=False, indent=2)
-        await asyncio.to_thread(file_path.write_text, serialized, encoding="utf-8")
-        return "local"
+    """Write a JSON object locally with an atomic file replacement."""
+    local_path = os.path.join(LOCAL_DATA_DIR, os.path.basename(path))
+    temp_path = f"{local_path}.{uuid.uuid4().hex}.tmp"
 
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    encoded = base64.b64encode(json.dumps(content).encode()).decode()
-    payload = {
-        "message": message,
-        "content": encoded,
-        "sha": sha
-    }
-    async with session.put(url, headers=headers, json=payload) as response:
-        return await response.text()
+    async with _local_file_lock:
+        def write_json():
+            with open(temp_path, "w", encoding="utf-8") as file:
+                json.dump(content, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            os.replace(temp_path, local_path)
+
+        try:
+            await asyncio.to_thread(write_json)
+            return "saved"
+        except Exception:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+
+
+def initialize_local_data_files():
+    """Create the local JSON stores on first run."""
+    for filename in ("auth_list.json", "result.json"):
+        local_path = os.path.join(LOCAL_DATA_DIR, filename)
+        if not os.path.exists(local_path):
+            with open(local_path, "w", encoding="utf-8") as file:
+                json.dump({}, file, ensure_ascii=False, indent=2)
+                file.write("\n")
 
 @bot.message_handler(commands=['start'])
 async def start(message):
@@ -99,17 +122,9 @@ async def start(message):
 async def handle_key(message):
     global approve
     key = str(message.chat.id)
-    if is_admin(message.chat.id):
-        approve[message.chat.id] = True
-        user_data[message.chat.id] = {}
-        await bot.reply_to(
-            message,
-            " Admin access အတည်ပြုပြီးပါပြီ။ /input ဖြင့် Session URL ထည့်ပါ။"
-        )
-        return
     auth_list, _ = await get_file_content("auth_list.json")
-    if key in auth_list:
-        valid = check_key_expiration(auth_list[key])
+    if key == ADMIN_ID or key in auth_list:
+        valid = True if key == ADMIN_ID else check_key_expiration(auth_list[key])
         if valid:
             approve[message.chat.id] = True
             user_data[message.chat.id] = {}
@@ -249,7 +264,7 @@ async def genkey(message):
 @bot.message_handler(commands=['result'])
 async def handle_result(message):
     auth_list, _ = await get_file_content("auth_list.json")
-    if is_admin(message.chat.id) or str(message.chat.id) in auth_list:
+    if str(message.chat.id) == ADMIN_ID or str(message.chat.id) in auth_list:
         results, _ = await get_file_content("result.json")
         chat_id_str = str(message.chat.id)
         if chat_id_str in results and results[chat_id_str]:
@@ -315,12 +330,12 @@ async def recheck(message):
         await bot.reply_to(message, "/recheck ကိုအသုံးမပြုမီ /key ကိုအရင်ပြုလုပ်ပေးပါ။")
         return
     auth_list, _ = await get_file_content("auth_list.json")
-    if is_admin(message.chat.id) or str(message.chat.id) in auth_list:
+    if str(message.chat.id) == ADMIN_ID or str(message.chat.id) in auth_list:
         results, sha = await get_file_content("result.json")
         chat_id_str = str(message.chat.id)
         if chat_id_str in results and results[chat_id_str]:
             if message.chat.id not in user_data:
-                await bot.reply_to(message, "/scan ကိုအသုံးမပြုမီ /key ကိုအရင်ပြုလုပ်ပေးပါ။")
+                await bot.reply_to(message, "/scan6 ကိုအသုံးမပြုမီ /key ကိုအရင်ပြုလုပ်ပေးပါ။")
                 return
             if "session_url" not in user_data[message.chat.id]:
                 await bot.reply_to(message, "/recheck ကိုအသုံးမပြုမီ /input ဖြင့် Session URL ကိုအရင်ထည့်သွင်းပေးရပါမည်။")
@@ -426,7 +441,7 @@ async def scan(message):
     ):
         await bot.reply_to(
             message,
-            "/scan သည် အလုပ်လုပ်နေပြီဖြစ်သည် /scan ကိုထပ်မံမလုပ်ပါနှင့်။"
+            "/scan သည် အလုပ်လုပ်နေပြီဖြစ်သည် /scan6 ကိုထပ်မံမလုပ်ပါနှင့်။"
         )
         return
 
@@ -644,11 +659,9 @@ async def run_bruteforce(mode, chat_id, session_url, scan_id, message=None, prog
             if time.monotonic() - last_key_check >= 600:
                 auth_list, _ = await get_file_content("auth_list.json")
                 if (
-                    not is_admin(chat_id)
-                    and (
-                        str(chat_id) not in auth_list
-                        or not check_key_expiration(auth_list[str(chat_id)])
-                    )
+                    str(chat_id) != ADMIN_ID
+                    and (str(chat_id) not in auth_list
+                    or not check_key_expiration(auth_list[str(chat_id)]))
                 ):
                     approve[chat_id] = False
                     await bot.send_message(
@@ -1072,7 +1085,9 @@ async def main():
     )
     try:
         asyncio.create_task(web_server())
+        initialize_local_data_files()
         asyncio.create_task(github_update_scheduler())
+        await configure_bot_commands()
         await start_polling()
     finally:
         await session.close()
